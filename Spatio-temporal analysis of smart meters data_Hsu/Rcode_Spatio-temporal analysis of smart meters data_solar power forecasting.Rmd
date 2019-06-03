@@ -1,0 +1,533 @@
+  title: "Minor thesis-SPATIO-TEMPORAL ANALYSIS OF SMART METERS DATA-  Solar power forecasting."
+output:
+  html_document:
+  df_print: paged
+---
+
+## load libraries
+```{r}
+library(data.table)
+library(zoo)
+library(xts)
+library(dtw) 
+library(forecast) 
+library(randomForest)
+library(reshape2)
+library(dplyr) 
+library(Metrics)
+```
+
+##Step 1: Read "Customer solar output dataset" and "Postcode cloud cover dataset".
+
+#### 1.1 read customer data (ID, Postcode)
+```{r}
+c_pos <- read.csv("Postcode.csv")
+head(c_pos)
+```
+
+#### 1.2 unique Postcodes
+```{r}
+pos <- sort(unique(c_pos$Postcode))
+pos
+```
+
+#### 1.3 cloud cover postcodes' idx
+```{r}
+cc_pos_idx <- 
+  "3 5 6 8 13 15 16 17 19 20 21 23 24 25 26 27 30 31 32 37 38 39 40 41 43 44 47 48 49 51 52 53 54 55 56 57 58 60 61 66 67 68 69 70 71 72 73 76 77 78 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 98 99"
+cc_pos_idx <- as.numeric(unlist(strsplit(cc_pos_idx, " ")))
+cc_pos_idx
+```
+
+#### 1.4 cloud cover postcodes
+```{r}
+cc_pos <- c()
+for (i in cc_pos_idx){
+  cc_pos <- c(cc_pos, pos[i])
+}
+cc_pos
+```
+
+#### 1.5 cloud cover xts
+```{r}
+cloud <- read.csv(file = "cloudCover_df.csv", head = T)
+cloud_zoo <- read.zoo(cloud ,header = T)
+cloud_xts <- as.xts(cloud_zoo)
+head(cloud_xts,2)
+```
+
+#### 1.6 solar xts 
+```{r}
+solar <- read.csv(file = "solar_xts_adjusted.csv", head = T)
+solar$date<- as.POSIXct(solar$date, format="%Y-%m-%d %H:%M:%S",tz = "UTC")
+solar_zoo <- read.zoo(solar ,header = T)
+solar_xts <- as.xts(solar_zoo)
+head(solar_xts,2)
+```
+
+##Step 2. DTW mapping function that generates mapping data as external inputs for predictive models for a given postcode with its neighbouring postcode.
+
+#### 2.1 Function: DTW 
+```{r}
+dtw_trace <- function(c1,c2,step) {
+  trace <-dtw(c1, c2, k=T, step=step) 	
+}
+```
+
+#### 2.2 Function: DTW Similarity (distance)
+```{r}
+dtw_calculation <- function (c_pos, nbs_pos, cloud_xts) {
+  
+  #for storing the DTW distance of each pair
+  dist <- as.data.frame(matrix(0, length(nbs_pos),2))
+  colnames(dist) <- c("distance", "postcode")
+  
+  #postcode's cloud cover series
+  c1 <- unclass(cloud_xts[,c_pos])[,] 
+  
+  #distance = Infinity if c1 is all zero (missing value) 
+  if (sum(c1)==0){
+    dist[,1] <- Inf ; dist[,2] <- 0
+    return (dist)
+  }
+  else{
+    for (i in 1:length(nbs_pos)){
+      
+      #neighbouring postcode's cloud cover series
+      c2 <- unclass(cloud_xts[,nbs_pos[i]])[,] 
+      
+      #distance = Infinity if c2 is all zero (missing value) 
+      if (sum(c2)==0){
+        dist[i,1] <- Inf ; 
+        dist[i,2] <- nbs_pos[i]
+      }
+      
+      #DTW of c1 to c2, store DTW distance of the pair
+      else{ 
+        trace <- dtw_trace(scale(c1),scale(c2),typeIa)
+        dist[i,1] <- as.numeric(trace$distance)
+        dist[i,2] <- nbs_pos[i]
+      }  
+    }
+    #ascending order for postcodes by distance
+    dist<- dist[order(dist$distance),] 
+    return (dist)
+  }
+}
+```
+
+#### 2.3 Function: DTW Daily Mapping:
+3 * 48 matrix, where 3 = leg(mapping index),  dummy (1 for no mapping, 0 otherwise), neighbouring postcode's cloud cover mapped from leg
+
+```{r}
+dtw_mapping <- function (c_pos, nb_pos, cloud_xts) {
+  
+  #no mapping found: 
+  if (nb_pos == 0){ 
+    
+    mapping <- matrix(0,nrow(cloud_xts),3)
+    mapping[,2] <- 1
+    hd <- matrix(0,9,3) ; hd[,2] <- 1
+    tl <- matrix(0,8,3) ; tl[,2] <- 1
+    
+    #combine (t1 to t9 , t10 to t40 , t41 to t48) 
+    daily_mapping <- rbind(hd, mapping, tl) 
+    return (daily_mapping)
+  }
+  else{   
+    
+    #DTW for t10 to t40
+    c1 <- unclass(cloud_xts[,c_pos])[,]
+    c2 <- unclass(cloud_xts[,nb_pos])[,]
+    trace <- dtw_trace(scale(c1),scale(c2),typeIa)
+    
+    a <- 0 ; 
+    time_index <- 0
+    mapping <- matrix(0,length(c1),3)
+    
+    #index.vec
+    for ( k in 1:length(trace$index1)){
+      if (trace$index1[k]!=a){
+        time_index <- time_index +1
+        mapping[time_index,1] <- trace$index2[k] - trace$index1[k]
+      }
+      a = trace$index1[k]
+    }
+    
+    #leg.vec = replace idex as 0 forindex > 0
+    mapping[mapping[,1]>0,1] <- 0;  
+    
+    #dummy.vec
+    mapping[mapping[,1]==0,2] <- 1
+    
+    #cloud.vec: cloud cover data c2 mapped by leg.vec 
+    idx <- index(mapping) + mapping[,1]
+    mapping[mapping[,2]==0,3] <- c2[idx][mapping[,2]==0]
+    
+    #t1 to t9 (no cloud cover data) 
+    hd <- matrix(0,9,3) ; hd[,2] <- 1
+    #t41 to t48 (no cloud cover data) 
+    tl <- matrix(0,8,3) ; tl[,2] <- 1
+    
+    #combine all as a daily mapping: combine (t1 to t9 , t10 to t40 , t41 to t48) 
+    daily_mapping <- rbind(hd, mapping, tl)
+    return (daily_mapping)
+  }
+}   
+```
+
+
+
+##Step 3. Define seven methods including (seasonal naive, ARIMA, ARIMA +2 DTW, ARIMA +4 DTW, Random Forest,Random Forest +2 DTW, Random Forest + 4 DTW).
+
+#### 3.1 Arima model 
+```{r}
+arimaP <- function (pred, predH, train_obv, ct_solar_ts, frequency, K){
+  
+  pred_matrix <- matrix(0,pred,predH)
+  for (i in 1:pred){
+    
+    #input solar data 
+    st <- i ; nd <- i + train_obv-1 
+    inputs <- ts(ct_solar_ts[st:nd], frequency = frequency)
+    
+    #input fourier series
+    fuur <- fourier(inputs, K = K)
+    fuurf <- fourier(inputs, K= K, h=predH)
+    
+    #model fitted
+    print (i)
+    fit<-auto.arima(inputs, xreg=fuur,
+                    max.p = 5, max.q = 5,
+                    seasonal = FALSE,stepwise = TRUE)
+    
+    #forecast
+    fc <- forecast(fit, xreg=fuurf, h=predH)
+    pred_matrix[i,] <- fc$mean
+  }
+  return (pred_matrix[,predH])
+}
+```
+
+#### 3.2 Arima DTW model  ( number of DTW subjected to input data :dtw_fn_lag4)
+```{r}
+arimaDTW <- function (pred, predH, train_obv, ct_solar_ts, frequency, K, dtw_fn_lag4){
+  
+  pred_matrix <- matrix(0, pred, predH)
+  for (i in 1:pred){
+    
+    #input solar data 
+    st <- i ; nd <- i + train_obv-1 
+    inputs <- ts(ct_solar_ts[st:nd], frequency = frequency)
+    
+    #input fourier series
+    fuur <- fourier(inputs, K = K)
+    fuurf <- fourier(inputs, K= K, h=predH)
+    
+    #input DTW mapping 
+    dtw_train <- dtw_fn_lag4[st:nd,]
+    dtw_test <- dtw_fn_lag4[(nd+1):(nd+1+predH-1),]
+    
+    #model fitted
+    print (i)
+    fit<-auto.arima(inputs, xreg=cbind(fuur, dtw_train),
+                    max.p = 5, max.q = 5,
+                    seasonal = FALSE,stepwise = TRUE)
+    
+    #forecast
+    fc <- forecast(fit, xreg=cbind(fuurf, dtw_test), h=predH)
+    pred_matrix[i,] <- fc$mean
+  }
+  return (pred_matrix[,predH])
+}
+```
+
+### 3.3 Random Forest model
+```{r}
+RF <- function (pred, predH, train_obv, ct_solar_lags, ct_solar_ts,
+                K, lags){
+  
+  #fourier series 
+  fuur <- fourier(ct_solar_ts, K =  K)
+  
+  #training set------------------
+  
+  #solar data 
+  inputs_train <- ct_solar_lags[1:(train_obv-5-4+1),1:lags]
+  outputs_train <- ct_solar_lags[1:(train_obv-5-4+1),(lags+1):ncol(ct_solar_lags)]
+  
+  #input (solar data, fourier series)
+  inputs_train_matrix <- data.table(inputs_train,
+                                    fuur[(5+predH):(5+predH+nrow(outputs_train)-1),])
+
+  #test set ---------------------
+  
+  #solar data 
+  st <- train_obv-5+1; nd <- st + pred -1
+  inputs_test <- ct_solar_lags[st:nd,1:lags]
+  
+  #input (solar data, fourier series)
+  inputs_test_matrix <- data.table(inputs_test,
+                                   fuur[(train_obv+predH):(train_obv+predH+(pred)-1),])
+  
+  #train and predict---------------------
+  print("RF")
+  mod <- randomForest(x= inputs_train_matrix,
+                      y= outputs_train[,predH], #y = Y(t4)
+                      importance = TRUE)
+  return(predict(mod,inputs_test_matrix))
+} 
+```
+
+
+### 3.4 Random Forest  DTW model ( number of DTW subjected to input data :dtw_fn_lags)
+```{r}
+RFDTW <- function (pred, predH, train_obv, ct_solar_lags, ct_solar_ts,
+                   K, lags, dtw_fn_lags){
+  
+  #fourier series 
+  fuur <- fourier(ct_solar_ts, K =  K)
+  
+  #training set------------------
+  
+  #solar data 
+  inputs_train <- ct_solar_lags[1:(train_obv-5-4+1),1:lags]
+  outputs_train <- ct_solar_lags[1:(train_obv-5-4+1),(lags+1):ncol(ct_solar_lags)]
+  
+  #DTW mapping 
+  dtw_train <- dtw_fn_lags[1:(train_obv-5-4+1),]
+  
+  #input (solar data, fourier series,DTW mapping)
+  inputs_train_matrix <- data.table(inputs_train,
+                                    fuur[(5+predH):(5+predH+nrow(outputs_train)-1),],
+                                    dtw_train) 
+  #test set ---------------------
+  
+  #solar data 
+  st <- train_obv-5+1; nd <- st + pred -1
+  inputs_test <- ct_solar_lags[st:nd,1:lags]
+  
+  #DTW mapping 
+  dtw_test <- dtw_fn_lags[st:nd,]
+  
+  #input (solar data, fourier series,DTW mapping)
+  inputs_test_matrix <- data.table(inputs_test,
+                                   fuur[(train_obv+predH):(train_obv+predH+(pred)-1),],
+                                   dtw_test)
+  
+  #train and predict---------------------
+  print("RF")
+  mod <- randomForest(x= inputs_train_matrix,
+                      y= outputs_train[,predH], #y = Y(t4)
+                      importance = TRUE)
+  return(predict(mod,inputs_test_matrix))
+} 
+```
+
+#### 3.5 Seasonal Naive method
+```{r}
+s.naive <- function (ct_solar_ts, frequency, pred, train_obv){
+  st <- 4 ; nd <- 4+train_obv-1 
+
+  #input solar data 
+  inputs <- ts(ct_solar_ts[st:nd], frequency= frequency)
+  
+  #forecast
+  print ("snaive")
+  fc <- snaive(inputs, h=pred)
+  return (fc$mean)
+} 
+```
+
+
+
+## Step 4. Run implementation on the randomly select dates and output the predictions for the customer. 
+
+#### 4.1 a date list is set for randomly selected start date then plus next 29 day together as 30 days data as the training set.
+```{r}
+date_ls <- seq(as.Date("2011-01-01"), as.Date("2011-11-30"), by = "1 days") 
+head(date_ls)
+```
+
+#### 4.2 assign data for running the implementation.
+#### Note: for prediction more customer, place the r command(s) shown in Microsoft word file "R command(s) for postcode with neighbours" section 2 into the below block and run it.
+```{r}
+#run (postcode, neighbouring postcodes, dates, solar data, cloud cover data)
+
+#run prediction for customers under postcod 2134 
+run(2134, c(2200,2209,2208,2207,2203,2047,2135,2137,2190,2162,2048,2204), date_ls, solar_xts, cloud_xts,c_pos)
+
+# #run prediction for customers under postcod 2137 
+# run(2137, c(2200,2209,2208,2207,2203,2047,2135,2134,2190,2162,2048,2204,2066), date_ls, solar_xts, cloud_xts,c_pos)
+
+# #run prediction for customers under postcod 2203
+# run(2203, c(2208,2207,2216,2018,2044,2204,2048,2047,2135,2134,2137,2190), date_ls, solar_xts, cloud_xts,c_pos)
+```
+
+#### 4.3 run function for input data 
+```{r}
+run <- function (x1, x2, date_ls, solar_xts, cloud_xts,customerPostcode){
+  #obtain customer ID under the selected postcode 
+  custs <- customerPostcode[customerPostcode$Postcode== x1, 1]
+  
+  c_pos <- paste("X", x1 ,sep="" )
+  nb_pos <- paste("X", x2 ,sep="" )
+  
+  #call s1function
+  s1function(custs, c_pos, nb_pos, date_ls, solar_xts, cloud_xts)
+}
+```
+
+#### 4.4 s1function "for loop" for calling rund function for each randomly select dates and output prediction result when obtained the forecast from rund function
+```{r}
+s1function <- function (custs, c_pos, nb_pos, date_ls, solar_xts, cloud_xts){
+  
+  #test on 5 days
+  days <- 5 
+  # true y + pred y from 7 methods/models
+  mds <- 8  
+  
+  #------------------------------------
+  
+  #test for all customers under the selected postcode 
+  for (cust in custs){
+    cust <- paste("X", cust ,sep="" )
+    error_marix_all<- matrix(0,0,mds)
+    
+    #randomly selected days for training then testing  
+    set.seed(123)
+    seeds <- sample(1:100,days)
+    for (seed in  seeds){
+      
+      #call rund function 
+      error_marix <- rund(seed, date_ls, cust, c_pos, nb_pos, solar_xts, cloud_xts, mds)
+      
+      #get result
+      error_marix_all <- rbind(error_marix_all,error_marix)
+    }
+    name <- paste0("Pred_", cust, ".csv")
+    write.csv(error_marix_all, name, row.names=FALSE)
+  }
+}
+```
+
+#### 4.5 rund function for executing the predefined seven methods/models to do the forecast and record the results 
+```{r}
+rund <- function (seed, date_ls, cust, c_pos, nb_pos, solar_xts, cloud_xts, mds){
+  
+  frequency <- 48  # 30 mins interval
+  lags <- 5        # lags used 
+  K <- 5           # fourier 
+  
+  train_obv <- 48*30*1 #one month training 
+  predH <- 2*2     # predict horizon
+  pred <- 48*1    #testing Head 
+  
+  
+  #record true y and prediction from the seven methods/models
+  error_marix <- matrix(0, pred, mds)
+  
+  #period for training and testing (seed: randomly selected date for testing )
+  set.seed(seed)
+  start <- sample(date_ls, 1) ; end <- start+32 
+  date_ls <- seq(start,end, by = "1 days") 
+  time_frame <- paste(start,end, sep = "/")
+  solar_xts_sub <- solar_xts[time_frame]
+  ct_solar <- unclass(solar_xts_sub[,cust])[,]
+  ct_solar_ts <- ts(ct_solar, frequency= frequency)
+  
+  #get 4 DTW mapping --------------------
+  dtws <- 4
+  dtw_ls <- list()
+  
+  for (i in 1:length(date_ls)){
+    cloud_data <- cloud_xts[toString(date_ls[i])]
+    dist <- dtw_calculation(c_pos, nb_pos, cloud_data)
+    
+    temp <- list()
+    for (j in (1:dtws)){ 
+      nb_po <- dist[j,2]
+      temp[[j]] <- dtw_mapping (c_pos, nb_po, cloud_data)
+    }  
+    mapping <- do.call(cbind, temp)
+    dtw_ls[[i]] <- mapping
+  }
+  dtw_fn <- do.call(rbind, dtw_ls)
+  
+  #leg4 of 4 DTW mapping (used in ARIMA)-------------
+  lag4 <- matrix(0,4,(3*dtws)) 
+  lag4[,2]<- 1; lag4[,5]<- 1; lag4[,8]<- 1; lag4[,11]<- 1
+  dtw_fn_lag4 <- rbind(lag4,dtw_fn)
+  
+  
+  #leg1 to leg5 of 4 DTW mapping (used in Random forest)----------------
+  getLags <- function (vals, lags){#Function to get lags matrix 
+    vals <- ts(vals, frequency = 48)
+    lagVals <- list()
+    for(x in 1:(lags)) {
+      lagVals [[x]] <- stats::lag(vals, x)
+    }
+    mydata <- do.call(cbind, lagVals)
+    colnames(mydata) <- NULL
+    mydata <- mydata[complete.cases(mydata),]
+  }
+  
+  temp <- list ()
+  i1 <- 1
+  for (k in seq(1,10,3)){
+    dtw_ <- getLags(dtw_fn[,k],lags)
+    dtw_missing <- getLags(dtw_fn[,(k+1)],lags)
+    dtw_c2 <- getLags(dtw_fn[,(k+2)],lags)
+    temp[[i1]] <- cbind(dtw_,dtw_missing,dtw_c2)
+    i1 <- i1+1
+  }
+  dtw_fn_lags <- do.call(cbind, temp)
+  colnames(dtw_fn_lags) <- c(paste0("DTWlg[", seq(1:(lags*3*dtws)), "]")) 
+  
+  #lag values for solar input data----------------
+  lagVals <- list()
+  for(x in 1:(lags+predH)) {
+    lagVals [[x]] <- stats::lag(ct_solar_ts, x)
+  }
+  ct_solar_lags <- do.call(cbind, lagVals)
+  colnames(ct_solar_lags) <- NULL
+  ct_solar_lags <- ct_solar_lags[complete.cases(ct_solar_lags),]
+  
+  #record true y and pred y -----------------------
+  #ture y
+  st <- train_obv ; nd <- st + pred -1
+  ct_solar_lags_testY <- ct_solar_lags[(st):nd, 2:(2+predH-1)]
+  error_marix[,1] <- ct_solar_lags_testY[,4]
+  
+  #pred y from ARIMA
+  error_marix[,2] <- arimaP(pred, predH, train_obv, ct_solar_ts, frequency,
+                            K)
+  #pred y from ARIMA + 2DTW
+  error_marix[,3] <- arimaDTW(pred, predH, train_obv, ct_solar_ts, frequency,
+                              K, dtw_fn_lag4[,1:(3*2)])
+  
+  #pred y from ARIMA + 4DTW
+  error_marix[,4] <- arimaDTW(pred, predH, train_obv, ct_solar_ts, frequency,
+                              K, dtw_fn_lag4[,1:(3*4)])
+  
+  #pred y from Random Forest  
+  error_marix[,5] <- RF(pred, predH, train_obv, ct_solar_lags, ct_solar_ts,
+                        K, lags)
+
+  #pred y from Random Forest + 2DTW 
+  error_marix[,6] <- RFDTW(pred, predH, train_obv, ct_solar_lags, ct_solar_ts,
+                           K, lags, dtw_fn_lags[,1:(3*2*lags)])
+ 
+  #pred y from Random Forest + 4DTW 
+  error_marix[,7] <- RFDTW(pred, predH, train_obv, ct_solar_lags, ct_solar_ts,
+                           K, lags, dtw_fn_lags[,1:(3*4*lags)])
+  
+  #pred y from snaive
+  error_marix[,8] <- s.naive(ct_solar_ts, frequency, pred, train_obv)
+  
+  return (error_marix)
+}  
+```
+
+## End.
+
